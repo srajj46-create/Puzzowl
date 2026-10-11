@@ -42,7 +42,10 @@ class BotService : AccessibilityService() {
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.END or Gravity.CENTER_VERTICAL }
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            y = (resources.displayMetrics.heightPixels * 0.78).toInt()
+        }
         wm.addView(btn, lp)
     }
 
@@ -109,12 +112,23 @@ class BotService : AccessibilityService() {
     }
 
     private suspend fun solveQuiz(els: List<Text.Element>, w: Int, h: Int) {
-        // question band (white box) and options band, as screen-height ratios
         val q = els.filter { val y = it.boundingBox!!.centerY(); y > h * 0.33 && y < h * 0.49 }
             .sortedBy { it.boundingBox!!.left }.joinToString(" ") { it.text }
-        val m = Regex("(\\d+)\\s*([^\\d\\s=]*)\\s*(\\d+)").find(q) ?: return
-        val a = m.groupValues[1].toInt(); val b = m.groupValues[3].toInt()
-        val opChar = m.groupValues[2]
+        val numMatches = Regex("\\d+").findAll(q).toList()
+        if (numMatches.size < 2) return
+        val nums = numMatches.map { it.value.toDouble() }
+
+        // operator between each pair of numbers ('?' = unreadable)
+        val gaps = (0 until numMatches.size - 1).map { i ->
+            val g = q.substring(numMatches[i].range.last + 1, numMatches[i + 1].range.first)
+            when {
+                g.any { it == '+' } -> '+'
+                g.any { it in "-−–—_~" } -> '-'
+                g.any { it in "xX×*" } -> '*'
+                g.any { it in "÷/:" } -> '/'
+                else -> '?'
+            }
+        }
 
         val opts = els.filter { val y = it.boundingBox!!.centerY(); y > h * 0.50 && y < h * 0.80 }
             .mapNotNull { e ->
@@ -123,35 +137,54 @@ class BotService : AccessibilityService() {
             }
         if (opts.isEmpty()) return
 
-        fun calc(op: Char): Int? = when (op) {
-            '+' -> a + b
-            '-' -> a - b
-            '*' -> a * b
-            '/' -> if (b != 0 && a % b == 0) a / b else null
-            else -> null
+        // fill unknown operators with every combination, keep results that match an option
+        val unknown = gaps.indices.filter { gaps[it] == '?' }
+        val all = "+-*/"
+        var combos = 1; repeat(unknown.size) { combos *= 4 }
+        val hits = mutableMapOf<Int, Pair<Int, Text.Element>>()
+        for (c in 0 until combos) {
+            val ops = gaps.toMutableList()
+            var code = c
+            for (u in unknown) { ops[u] = all[code % 4]; code /= 4 }
+            for (mode in 0..1) { // 0 = normal precedence, 1 = left to right
+                val r = evaluate(nums, ops, mode == 0) ?: continue
+                val ri = Math.round(r).toInt()
+                if (Math.abs(r - ri) > 1e-9) continue
+                val o = opts.firstOrNull { it.first == ri } ?: continue
+                if (unknown.isEmpty() && mode == 0) { hits.clear(); hits[ri] = o; break }
+                hits.putIfAbsent(ri, o)
+            }
+            if (unknown.isEmpty() && hits.isNotEmpty()) break
         }
-        val preferred: Char? = when {
-            opChar.any { it in "+" } -> '+'
-            opChar.any { it in "-−–—_" } -> '-'
-            opChar.any { it in "xX×*" } -> '*'
-            opChar.any { it in "÷/:" } -> '/'
-            else -> null
-        }
-        var target: Pair<Int, Text.Element>? = null
-        if (preferred != null) {
-            val r = calc(preferred)
-            target = opts.firstOrNull { it.first == r }
-        }
-        if (target == null) { // operator unreadable / mismatch: accept only if exactly one operator fits
-            val hits = "+-*/".mapNotNull { op -> calc(op)?.let { r -> opts.firstOrNull { it.first == r } } }
-                .distinctBy { it.first }
-            if (hits.size == 1) target = hits[0]
-        }
-        if (target == null) { Log.d(tag, "no match: $q opts=${opts.map { it.first }}"); return }
+        if (hits.size != 1) { Log.d(tag, "no/ambiguous match: $q opts=${opts.map { it.first }}"); return }
+        val target = hits.values.first()
         val bb = target.second.boundingBox!!
         Log.d(tag, "$q -> ${target.first}")
         tap(bb.centerX().toFloat(), bb.centerY().toFloat())
         delay(700)
+    }
+
+    private fun evaluate(nums: List<Double>, ops: List<Char>, precedence: Boolean): Double? {
+        val n = nums.toMutableList(); val o = ops.toMutableList()
+        if (precedence) {
+            var i = 0
+            while (i < o.size) {
+                if (o[i] == '*' || o[i] == '/') {
+                    val r = if (o[i] == '*') n[i] * n[i + 1] else { if (n[i + 1] == 0.0) return null; n[i] / n[i + 1] }
+                    n[i] = r; n.removeAt(i + 1); o.removeAt(i)
+                } else i++
+            }
+        }
+        var res = n[0]
+        for (j in o.indices) {
+            res = when (o[j]) {
+                '+' -> res + n[j + 1]
+                '-' -> res - n[j + 1]
+                '*' -> res * n[j + 1]
+                else -> { if (n[j + 1] == 0.0) return null; res / n[j + 1] }
+            }
+        }
+        return res
     }
 
     // ---------------- helpers ----------------
